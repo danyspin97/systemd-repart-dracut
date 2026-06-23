@@ -24,17 +24,49 @@ err()
 
 [ -e /etc/initrd-release ] || err "No initrd environment"
 
-# Need to write to /sysroot/etc/fstab to add new partitions
-if ! [ -w /sysroot/etc ]; then
-        # Transactional systems have a separate mount for /etc.
-        # In the nested subvolume setup there's a bind mount that is read-only at first.
-        if findmnt /sysroot/etc >/dev/null; then
-                mount -o remount,rw /sysroot/etc
-        else
-                mount -o remount,rw /sysroot
-        fi
+# Copy this file so that we can use it to mount all partitions later
+cp /sysroot/etc/fstab /run/fstab.dracut
+bind_etc=false
+# Only MicroOS has /etc bind mount
+if grep -q "/etc" /sysroot/etc/fstab; then
+	bind_etc=true
+    # Skip /etc bind mount, it will be done manually later
+	sed -e "/\/etc/d" -i /run/fstab.dracut
+fi
+
+# Ensure that all mountpoints are mounted so that systemd-repart CopyFiles work
+# properly, because only /sysroot is mounted when systemd-repart-dracut runs
+echo "Mounting all filesystems from fstab"
+mount > /run/mount.before
+mount --all --target-prefix /sysroot --fstab /run/fstab.dracut
+mount > /run/mount.after
+
+# In MicroOS, /etc is bind mounted to make it writable as the rest of the
+# subvol is read-only. mount --target-prefix <DIR> doesn't work for bind mount,
+# as <DIR> is not prefixed to the target of the bind mount. Do it manually to
+# ensure /etc is writable 
+if [[ $external_etc == "true" ]]; then
+	mount --bind /sysroot/etc /sysroot/etc
+    mount -o remount,rw /sysroot/etc
+# In case /sysroot is not read-write, remount, this is the case for Tumbleweed
+elif ! [ -w /sysroot/etc ]; then
+    mount -o remount,rw /sysroot
 fi
 
 log_info "Reparting with systemd-repart:"
 /usr/bin/systemd-repart --dry-run=no --append-fstab=auto --generate-fstab=/etc/fstab
 log_info "Repartition completed"
+
+# Unmount all devices and subvolumes that we mounted above
+echo "Unmounting all mounts inside"
+grep -Fxvf /run/mount.before /run/mount.after | cut -d" " -f 3 | while read -r mountpoint; do
+    # This shouldn't be needed, but it's just to be sure we don't unmount
+    # anything unnecessary
+	if [[ "$mountpoint" == /sysroot/* ]]; then
+		umount "$mountpoint"
+	fi
+done
+
+if [[ $external_etc == "true" ]]; then
+    umount /sysroot/etc
+fi
